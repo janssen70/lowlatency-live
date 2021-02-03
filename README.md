@@ -11,11 +11,11 @@ insights:
 
 Only tested on Linux
 
-###Prerequisites
+### Prerequisites
 
 [Install GStreamer](https://gstreamer.freedesktop.org/documentation/installing/on-linux.html?gi-language=c)
 
-###Build
+### Build
 
 ```
 gcc demo.c -o demo `pkg-config --cflags --libs gstreamer-video-1.0 gtk+-3.0 gstreamer-1.0
