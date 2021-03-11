@@ -3,7 +3,7 @@
  * =====================================
  *
  * A demo program that shows a low latency live h.264 stream from an IP camera
- * in a GTK applicaion
+ * in a GTK application
  *
  * Code adapted from:
  *
@@ -14,13 +14,35 @@
  * Items of interest:
  *   
  *   - provide videosink with window pointer through callback (tell_window)
- *   - the pipeline itself (gst_parse_launch)
+ *
+ *   - the pipeline itself (create_pipeline). Creating directly compared to
+ *     using gst_parse_launch() creates more control but also a lot more code
+ *
+ *     It uses several of the most important latency parameters for further
+ *     experimentation
+ *
+ *   - Catching of qos messages, although not much is done with the data except
+ *     printing it
+ *
+ *   - handoff signal from identity, again not much done except printing
+ *
+ *   - Latency is quite decent, observed 100..190ms end-to-end for a 5 megapixel
+ *     30 fps stream. The 100 (actually 96) only once :) 150..160 more common.
+ *     Tested on AMD Ryzen 5 2600/NVIDIA GeForce GTX 1060
+ *
+ * Todo:
+ *   - Active supervision of the latency
+ *   - Investigate whether this:
+ *     http://gstreamer-devel.966125.n4.nabble.com/rtspsrc-jitterbuffer-stats-td4680812.html
+ *     offers an optimization (partly done)
+ *   - Investigate renew-stream messages to the source in case of decoder
+ *     error
  *
  * Notes:
- *   - Some features of the original sample don't make sense anymore (e.g. slider
- *     has no use on live input) or are left in broken condition
+ *   - Some remaining features of the original sample don't make sense anymore
+ *     (e.g. slider has no use on live input) or are left in broken condition
  *
- * Use at your own risk 
+ * Use at your own risk. Who's really into it can see I'm not
  *
  * 2021, Erik
  */
@@ -46,16 +68,17 @@
 
 typedef struct _CustomData 
 {
-  GstElement* pipeline;           /* Our one and only pipeline */
+  GstElement*  pipeline;           /* Our one and only pipeline */
 
-  gboolean    is_live;
-  GtkWidget*  slider;              /* Slider widget to keep track of current position */
-  GtkWidget*  streams_list;        /* Text widget to display info about the streams */
-  gulong      slider_update_signal_id; /* Signal ID for the slider update signal */
+  gboolean     is_live;
+  GtkWidget*   slider;              /* Slider widget to keep track of current position */
+  GtkWidget*   streams_list;        /* Text widget to display info about the streams */
+  gulong       slider_update_signal_id; /* Signal ID for the slider update signal */
 
-  GstState    state;                 /* Current state of the pipeline */
-  gint64      duration;                /* Duration of the clip, in nanoseconds */
-  guintptr    window_handle;
+  GstState     state;                 /* Current state of the pipeline */
+  gint64       duration;                /* Duration of the clip, in nanoseconds */
+  guintptr     window_handle;
+  GstClockTime last_pts;
 } 
 CustomData;
 
@@ -204,10 +227,10 @@ static void create_ui (CustomData *data)
 }
 
 /* 
- * This function is called periodically to refresh the GUI 
+ * Called every second to print some time info
  */
 
-static gboolean refresh_ui(CustomData *data) 
+static gboolean update_timeinfo(CustomData *data) 
 {
   gint64 current = -1;
 
@@ -217,54 +240,21 @@ static gboolean refresh_ui(CustomData *data)
     return TRUE;
   }
 
-  if (data->is_live)
-  {
-     return TRUE;
-  }
-
-  /* If we didn't know it yet, query the stream duration */
-  if (!GST_CLOCK_TIME_IS_VALID (data->duration)) 
-  {
-     if (!gst_element_query_duration(data->pipeline, GST_FORMAT_TIME, &data->duration)) 
-     {
-        g_printerr ("Could not query current duration.\n");
-     } 
-     else {
-        /* Set the range of the slider to the clip duration, in SECONDS */
-        g_print ("Time: %" GST_TIME_FORMAT "\r", GST_TIME_ARGS (data->duration));
-        gtk_range_set_range (GTK_RANGE (data->slider), 0, (gdouble)data->duration / GST_SECOND);
-     }
-  }
-
   if (gst_element_query_position(data->pipeline, GST_FORMAT_TIME, &current)) 
   {
-     /* Set slider while "value-changed" signal is blocked, so the slider_cb
-      * function is not called (which would trigger a seek the user has not
-      * requested) 
-      */
-     g_signal_handler_block (data->slider, data->slider_update_signal_id);
-     gtk_range_set_value (GTK_RANGE (data->slider), (gdouble)current / GST_SECOND);
-     g_signal_handler_unblock (data->slider, data->slider_update_signal_id);
+
+     GstClockTimeDiff diff = GST_CLOCK_DIFF(current, data->last_pts);
+     g_print("Last PTS: %" GST_TIME_FORMAT ", current: %" GST_TIME_FORMAT ", Diff with current: %li.%03lims\n", GST_TIME_ARGS(data->last_pts), GST_TIME_ARGS(current), diff / 1000000, (labs(diff) / 1000) % 1000);
   }
   return TRUE;
 }
 
 /* 
- * New metadata is discovered in the stream. We are possibly in a GStreamer
- * working thread, so we notify the main thread of this event through a
- * message in the bus 
+ * An error message was posted on the bus 
  */
 
-static void tags_cb (GstElement *pipeline, gint stream, CustomData *data) 
+static void error_cb(GstBus *bus, GstMessage *msg, CustomData *data) 
 {
-  gst_element_post_message(
-      pipeline, 
-	  gst_message_new_application(GST_OBJECT(pipeline), gst_structure_new_empty ("tags-changed"))
-  );
-}
-
-/* This function is called when an error message is posted on the bus */
-static void error_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
   GError *err;
   gchar *debug_info;
 
@@ -279,11 +269,19 @@ static void error_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
   gst_element_set_state (data->pipeline, GST_STATE_READY);
 }
 
-/* This function is called when an End-Of-Stream message is posted on the bus.
- * We just set the pipeline to READY (which stops playback) */
+/* 
+ * This function is called when an End-Of-Stream message is posted on the bus.
+ * We just set the pipeline to READY (which stops playback) 
+ */
+
 static void eos_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
   g_print ("End-Of-Stream reached.\n");
   gst_element_set_state (data->pipeline, GST_STATE_READY);
+}
+
+static void handoff_cb(GstElement* identity, GstBuffer* buffer, CustomData *data)
+{
+  data->last_pts = GST_BUFFER_PTS(buffer);
 }
 
 /* 
@@ -300,94 +298,9 @@ static void state_changed_cb(GstBus *bus, GstMessage *msg, CustomData *data)
    g_print ("State set to %s\n", gst_element_state_get_name (new_state));
    if (old_state == GST_STATE_READY && new_state == GST_STATE_PAUSED) 
    {
-      /* For extra responsiveness, we refresh the GUI as soon as we reach the PAUSED state */
-      refresh_ui (data);
+      /* Refresh the GUI as soon as we reach the PAUSED state */
+      update_timeinfo(data);
    }
-}
-
-/* Extract metadata from all the streams and write it to the text widget in the GUI */
-static void analyze_streams (CustomData *data) {
-  gint i;
-  GstTagList *tags;
-  gchar *str, *total_str;
-  guint rate;
-  gint n_video, n_audio, n_text;
-  GtkTextBuffer *text;
-
-  /* Clean current contents of the widget */
-  text = gtk_text_view_get_buffer (GTK_TEXT_VIEW (data->streams_list));
-  gtk_text_buffer_set_text (text, "", -1);
-
-  /* Read some properties */
-  g_object_get (data->pipeline, "n-video", &n_video, NULL);
-  g_object_get (data->pipeline, "n-audio", &n_audio, NULL);
-  g_object_get (data->pipeline, "n-text", &n_text, NULL);
-
-  for (i = 0; i < n_video; i++) 
-  {
-    tags = NULL;
-    /* Retrieve the stream's video tags */
-    g_signal_emit_by_name (data->pipeline, "get-video-tags", i, &tags);
-    if (tags) 
-	{
-      total_str = g_strdup_printf ("video stream %d:\n", i);
-      gtk_text_buffer_insert_at_cursor (text, total_str, -1);
-      g_free (total_str);
-      gst_tag_list_get_string (tags, GST_TAG_VIDEO_CODEC, &str);
-      total_str = g_strdup_printf ("  codec: %s\n", str ? str : "unknown");
-      gtk_text_buffer_insert_at_cursor (text, total_str, -1);
-      g_free (total_str);
-      g_free (str);
-      gst_tag_list_free (tags);
-    }
-  }
-
-  for (i = 0; i < n_audio; i++) {
-    tags = NULL;
-    /* Retrieve the stream's audio tags */
-    g_signal_emit_by_name (data->pipeline, "get-audio-tags", i, &tags);
-    if (tags) {
-      total_str = g_strdup_printf ("\naudio stream %d:\n", i);
-      gtk_text_buffer_insert_at_cursor (text, total_str, -1);
-      g_free (total_str);
-      if (gst_tag_list_get_string (tags, GST_TAG_AUDIO_CODEC, &str)) {
-        total_str = g_strdup_printf ("  codec: %s\n", str);
-        gtk_text_buffer_insert_at_cursor (text, total_str, -1);
-        g_free (total_str);
-        g_free (str);
-      }
-      if (gst_tag_list_get_string (tags, GST_TAG_LANGUAGE_CODE, &str)) {
-        total_str = g_strdup_printf ("  language: %s\n", str);
-        gtk_text_buffer_insert_at_cursor (text, total_str, -1);
-        g_free (total_str);
-        g_free (str);
-      }
-      if (gst_tag_list_get_uint (tags, GST_TAG_BITRATE, &rate)) {
-        total_str = g_strdup_printf ("  bitrate: %d\n", rate);
-        gtk_text_buffer_insert_at_cursor (text, total_str, -1);
-        g_free (total_str);
-      }
-      gst_tag_list_free (tags);
-    }
-  }
-
-  for (i = 0; i < n_text; i++) {
-    tags = NULL;
-    /* Retrieve the stream's subtitle tags */
-    g_signal_emit_by_name (data->pipeline, "get-text-tags", i, &tags);
-    if (tags) {
-      total_str = g_strdup_printf ("\nsubtitle stream %d:\n", i);
-      gtk_text_buffer_insert_at_cursor (text, total_str, -1);
-      g_free (total_str);
-      if (gst_tag_list_get_string (tags, GST_TAG_LANGUAGE_CODE, &str)) {
-        total_str = g_strdup_printf ("  language: %s\n", str);
-        gtk_text_buffer_insert_at_cursor (text, total_str, -1);
-        g_free (total_str);
-        g_free (str);
-      }
-      gst_tag_list_free (tags);
-    }
-  }
 }
 
 /*
@@ -414,88 +327,201 @@ static GstBusSyncReply tell_window(GstBus * bus, GstMessage * message, CustomDat
  * Here we retrieve the message posted by the tags_cb callback 
  */
 
-static void application_cb (GstBus *bus, GstMessage *msg, CustomData *data) 
+static void application_cb(GstBus *bus, GstMessage *msg, CustomData *data) 
 {
 	if (g_strcmp0 (gst_structure_get_name (gst_message_get_structure (msg)), "tags-changed") == 0) 
 	{
-		analyze_streams (data);
+		/* removed */
 	}
+}
+
+/*
+ * QOS message sent on the bus. For now we don't do much, just print.
+ *
+ * But it's a starting point for more specific handling...
+ */
+
+static void qos_cb(GstBus *bus, GstMessage *msg, CustomData *data) 
+{
+   guint64 running_time;
+   guint64 stream_time;
+   guint64 timestamp;
+   guint64 duration;
+   gboolean live;
+
+   GstFormat format;
+   guint64 processed;
+   guint64 dropped;
+
+   gint64 jitter;
+   gdouble proportion;
+   gint quality;
+
+   gst_message_parse_qos(msg, &live, &running_time, &stream_time, &timestamp, &duration);
+   gst_message_parse_qos_stats (msg, &format, &processed, &dropped);
+   gst_message_parse_qos_values (msg, &jitter, &proportion, &quality);
+
+   g_print(
+         "QOS! running_time: %" GST_TIME_FORMAT ", stream_time: %" GST_TIME_FORMAT 
+         ", ts: %" GST_TIME_FORMAT ", duration: %" GST_TIME_FORMAT
+         ", processed: %lu, dropped: %lu, jitter: %li\n",
+         GST_TIME_ARGS(running_time), 
+         GST_TIME_ARGS(stream_time),
+         GST_TIME_ARGS(timestamp),
+         GST_TIME_ARGS(duration),
+         processed,
+         dropped,
+         jitter
+         );
+
+}
+
+/*
+ * Handler for dynamic adding of rtsp pad, which only appears after
+ * initialization. See:
+ *
+ * https://gstreamer.freedesktop.org/documentation/application-development/basics/pads.html
+ *
+ * Credits: https://stackoverflow.com/questions/32233370/
+ */
+
+static void rtsp_pad_added_cb(GstElement* element, GstPad* pad, gpointer data)
+{
+   gchar* name = gst_pad_get_name(pad);
+   if (!gst_element_link_pads(element, name, GST_ELEMENT(data), "sink"))
+   {
+      printf("Failed to link elements\n");
+   }
+   g_free(name);
+}
+
+/*
+ * Create video pipeline and take care of naming all the elements. It replaces
+ * 
+ * gst_parse_launch("rtspsrc location=<url> user-id=<user> user-pw=<pw> latency=0 ! 
+ * rtpjitterbuffer latency=80 ! rtph264depay ! avdec_h264 ! identity ! autovideosink", NULL);
+ *
+ * and brings the advantage (later on) that we can address each element
+ * individually and add the callback to the identity more easily
+ *
+ * Note that rtspsrc has an rtpjitterbuffer inside so you shouldn't insert it
+ * in the pipeline like above
+ *
+ * https://gstreamer.freedesktop.org/documentation/additional/rtp.html?gi-language=c
+ * https://gstreamer.freedesktop.org/documentation/rtsp/rtspsrc.html?gi-language=c#rtspsrc-page
+ *
+ */
+
+static GstElement* create_pipeline(const char* pipeline_prefix, const char *url, const char* username, const char* password, void* custom_data)
+{
+   char buf[64];
+   int offs = strlen(pipeline_prefix);
+
+   if (offs < sizeof(buf))
+   {
+      strcpy(buf, pipeline_prefix);
+      strcpy(buf+offs, "videoplayer");
+      GstElement* pipeline = gst_pipeline_new(buf);
+
+      strcpy(buf+offs, "source");
+      GstElement* rtp_source = gst_element_factory_make ("rtspsrc", buf);
+      /*
+       * Setting ntp-time-source=2 removes considerable latency in case of no
+       * timesync. It makes it as nearly fast as Low Latency Viewer, the
+       * latency value for dejitter being the only difference
+       */
+      g_object_set(G_OBJECT(rtp_source), "location", url, "user-id", username, "user-pw", password, "latency", 20, "ntp-time-source", 2, NULL);
+
+      strcpy(buf+offs, "depay");
+      GstElement* depay = gst_element_factory_make ("rtph264depay", buf);
+      strcpy(buf+offs, "decoder");
+      GstElement* decoder = gst_element_factory_make ("avdec_h264", buf);
+      strcpy(buf+offs, "identity");
+      GstElement* identity = gst_element_factory_make ("identity", buf);
+      strcpy(buf+offs, "sink");
+      GstElement* sink = gst_element_factory_make ("xvimagesink", buf);
+      // g_object_set(G_OBJECT(sink), "sync", FALSE, NULL);
+      g_object_set(G_OBJECT(sink), "qos", TRUE, NULL);
+      g_object_set(G_OBJECT(sink), "render-delay", 0, NULL);
+
+      if (rtp_source && depay && decoder && identity && sink)
+      {
+         gst_bin_add_many(GST_BIN(pipeline), rtp_source, depay, decoder, identity, sink, NULL);
+         g_signal_connect(rtp_source, "pad-added", G_CALLBACK(rtsp_pad_added_cb), depay);
+         if (gst_element_link_many(depay, decoder, identity, sink, NULL)) 
+         {
+            // https://stackoverflow.com/questions/45079457/gstreamer-buffer-pts#45083086
+            g_signal_connect(identity, "handoff", G_CALLBACK(handoff_cb), custom_data);
+            return pipeline;
+         }
+         g_warning("Failed to link elements!");
+      }
+      else
+      {
+         g_warning("Failed to create one or more elements!");
+      }
+   }
+   return NULL;
 }
 
 int main(int argc, char *argv[]) 
 {
-  CustomData data;
+   CustomData data;
 
-  GstStateChangeReturn ret;
-  GstBus *bus;
+   GstStateChangeReturn ret;
+   GstBus *bus;
 
-  gtk_init (&argc, &argv);
-  gst_init (&argc, &argv);
-  memset(&data, 0, sizeof (data));
-  data.duration = GST_CLOCK_TIME_NONE;
+   gtk_init (&argc, &argv);
+   gst_init (&argc, &argv);
+   memset(&data, 0, sizeof (data));
+   data.duration = GST_CLOCK_TIME_NONE;
 
-  /* Create the GUI (and save the window pointer) */
-  create_ui(&data);
+   /* Create the GUI (and save the window pointer) */
+   create_ui(&data);
 
-  data.pipeline = gst_parse_launch ("rtspsrc location=rtsp://192.168.0.33/axis-media/media.amp?resolution=1280x720 user-id=root user-pw=pass latency=0 ! rtpjitterbuffer latency=80 ! rtph264depay ! avdec_h264 ! autovideosink", NULL);
-  if (!data.pipeline) 
-  {
-    g_printerr ("Error creating pipeline\n");
-    return -1;
-  }
+   // data.pipeline = gst_parse_launch ("rtspsrc location=rtsp://192.168.0.33/axis-media/media.amp?resolution=1280x720 user-id=root user-pw=pass latency=40 ! rtph264depay ! avdec_h264 ! identity ! autovideosink", NULL);
+   data.pipeline = create_pipeline("input1-", argv[1], "root", "pass", &data);
+   if (!data.pipeline) 
+   {
+      g_printerr ("Error creating pipeline\n");
+      return -1;
+   }
 
-//  g_signal_connect (G_OBJECT (data.playbin), "video-tags-changed", (GCallback) tags_cb, &data);
-//  g_signal_connect (G_OBJECT (data.playbin), "audio-tags-changed", (GCallback) tags_cb, &data);
-//  g_signal_connect (G_OBJECT (data.playbin), "text-tags-changed", (GCallback) tags_cb, &data);
+   bus = gst_element_get_bus(data.pipeline);
+   gst_bus_set_sync_handler(bus, (GstBusSyncHandler) tell_window, &data, NULL);
+   gst_bus_add_signal_watch(bus);
 
-  bus = gst_element_get_bus(data.pipeline);
-  gst_bus_set_sync_handler(bus, (GstBusSyncHandler) tell_window, &data, NULL);
-  gst_bus_add_signal_watch(bus);
+   g_signal_connect (G_OBJECT (bus), "message::error", (GCallback)error_cb, &data);
+   g_signal_connect (G_OBJECT (bus), "message::eos", (GCallback)eos_cb, &data);
+   g_signal_connect (G_OBJECT (bus), "message::state-changed", (GCallback)state_changed_cb, &data);
+   g_signal_connect (G_OBJECT (bus), "message::qos", (GCallback)qos_cb, &data);
+   gst_object_unref (bus);
 
-  g_signal_connect (G_OBJECT (bus), "message::error", (GCallback)error_cb, &data);
-  g_signal_connect (G_OBJECT (bus), "message::eos", (GCallback)eos_cb, &data);
-  g_signal_connect (G_OBJECT (bus), "message::state-changed", (GCallback)state_changed_cb, &data);
-  g_signal_connect (G_OBJECT (bus), "message::application", (GCallback)application_cb, &data);
-  gst_object_unref (bus);
+   /* Start playing */
+   ret = gst_element_set_state(data.pipeline, GST_STATE_PLAYING);
+   switch (ret)
+   {
+   case GST_STATE_CHANGE_FAILURE:
+      {
+         g_printerr ("Unable to set the pipeline to the playing state.\n");
+         gst_object_unref (data.pipeline);
+         return -1;
+      }
+   case GST_STATE_CHANGE_NO_PREROLL:
+      /* Got this from basic-tutorial-12 but it doesn't seem to work */
+      data.is_live = TRUE;
+      break;
+   default:
+      break;
+   }
 
-  /* Start playing */
-  ret = gst_element_set_state(data.pipeline, GST_STATE_PLAYING);
-  switch (ret)
-  {
-     case GST_STATE_CHANGE_FAILURE:
-     {
-        g_printerr ("Unable to set the pipeline to the playing state.\n");
-        gst_object_unref (data.pipeline);
-        return -1;
-     }
-     case GST_STATE_CHANGE_NO_PREROLL:
-        /* Got this from basic-tutorial-12 but it doesn't seem to work */
-        data.is_live = TRUE;
-        break;
-     default:
-        break;
-  }
+   g_timeout_add_seconds(1, (GSourceFunc)update_timeinfo, &data);
 
-  /* 
-   * Register a function that GLib will call every second 
-   *
-   * Note: disabled, makes no sense on live source
-   */
-#if 0
-   g_timeout_add_seconds(1, (GSourceFunc)refresh_ui, &data);
-#endif
+   gtk_main ();
 
-  /* 
-   * Start the GTK main loop. We will not regain control until gtk_main_quit is called. 
-   */
-  gtk_main ();
-
-  /* 
-   * Free resources 
-   */
-  gst_element_set_state(data.pipeline, GST_STATE_NULL);
-  gst_object_unref(data.pipeline);
-  return 0;
+   gst_element_set_state(data.pipeline, GST_STATE_NULL);
+   gst_object_unref(data.pipeline);
+   return 0;
 }
 
 /* vim: set nowrap sw=3 sts=3 et fdm=marker: */
